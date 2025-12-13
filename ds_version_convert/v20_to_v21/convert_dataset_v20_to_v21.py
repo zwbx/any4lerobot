@@ -1,103 +1,89 @@
-from concurrent.futures import ProcessPoolExecutor
-import numpy as np
-from tqdm import tqdm
+import argparse
 
-from lerobot.datasets.compute_stats import get_feature_stats, sample_indices
+from convert_stats import ERROR_LOG_PATH, check_aggregate_stats, convert_stats
+from huggingface_hub import HfApi
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.utils import write_episode_stats
+from lerobot.datasets.utils import EPISODES_STATS_PATH, STATS_PATH, load_stats, write_info
+from lerobot.datasets.v21.convert_dataset_v20_to_v21 import V20, V21
 
 
-# -------- Worker-side globals --------
-_G = {}
-
-def _init_worker(repo_id: str, root: str, revision: str | None):
-    # 每个 worker 进程启动时只运行一次
-    _G["dataset"] = LeRobotDataset(repo_id, root=root, revision=revision)
-
-def _sample_episode_video_frames(ds: LeRobotDataset, episode_index: int, ft_key: str) -> np.ndarray:
-    ep_len = ds.meta.episodes[episode_index]["length"]
-    sampled_indices = sample_indices(ep_len)
-    query_timestamps = ds._get_query_timestamps(0.0, {ft_key: sampled_indices})
-    video_frames = ds._query_videos(query_timestamps, episode_index)
-    return video_frames[ft_key].numpy()
-
-def _convert_episode_stats(ep_idx: int):
-    # 任务函数：只接收 ep_idx（小参数）
-    ds: LeRobotDataset = _G["dataset"]
-
-    ep_start_idx = ds.episode_data_index["from"][ep_idx]
-    ep_end_idx = ds.episode_data_index["to"][ep_idx]
-
-    # ✅ 比 select(range(...)) 通常更快：连续区间切片
-    ep_data = ds.hf_dataset[ep_start_idx:ep_end_idx]  # dict[str, list/array]
-
-    ep_stats = {}
-    for key, ft in ds.features.items():
-        if ft["dtype"] == "video":
-            ep_ft_data = _sample_episode_video_frames(ds, ep_idx, key)
-        else:
-            # np.asarray 通常比 np.array 更少拷贝
-            ep_ft_data = np.asarray(ep_data[key])
-
-        axes_to_reduce = (0, 2, 3) if ft["dtype"] in ["image", "video"] else 0
-        keepdims = True if ft["dtype"] in ["image", "video"] else (ep_ft_data.ndim == 1)
-
-        ep_stats[key] = get_feature_stats(ep_ft_data, axis=axes_to_reduce, keepdims=keepdims)
-
-        if ft["dtype"] in ["image", "video"]:
-            # remove batch dim
-            ep_stats[key] = {k: v if k == "count" else np.squeeze(v, axis=0) for k, v in ep_stats[key].items()}
-
-    return ep_stats, ep_idx
-
-
-def convert_stats(dataset: LeRobotDataset, num_workers: int = 8, chunksize: int = 4):
-    assert dataset.episodes is None
-    print("Computing episodes stats")
-
-    total_episodes = dataset.meta.total_episodes
-
-    if num_workers > 0:
-        with ProcessPoolExecutor(
-            max_workers=num_workers,
-            initializer=_init_worker,
-            initargs=(dataset.repo_id, str(dataset.root), dataset.revision),
-        ) as ex:
-            # ✅ map + chunksize：调度开销更低
-            for ep_stats, ep_idx in tqdm(
-                ex.map(_convert_episode_stats, range(total_episodes), chunksize=chunksize),
-                total=total_episodes,
-            ):
-                dataset.meta.episodes_stats[ep_idx] = ep_stats
-    else:
-        # 单进程 fallback
-        _G["dataset"] = dataset
-        for ep_idx in tqdm(range(total_episodes)):
-            ep_stats, _ = _convert_episode_stats(ep_idx)
-            dataset.meta.episodes_stats[ep_idx] = ep_stats
-
-    # 写文件建议保持串行（避免 NFS/小文件并发抖动）
-    for ep_idx in tqdm(range(total_episodes)):
-        write_episode_stats(ep_idx, dataset.meta.episodes_stats[ep_idx], dataset.root)
-
-
-def check_aggregate_stats(
-    dataset: LeRobotDataset,
-    reference_stats: dict[str, dict[str, np.ndarray]],
-    video_rtol_atol: tuple[float] = (1e-2, 1e-2),
-    default_rtol_atol: tuple[float] = (5e-6, 6e-5),
+def convert_dataset(
+    repo_id: str,
+    root: str | None = None,
+    push_to_hub: bool = False,
+    delete_old_stats: bool = False,
+    branch: str | None = None,
+    num_workers: int = 4,
 ):
-    """Verifies that the aggregated stats from episodes_stats are close to reference stats."""
-    agg_stats = aggregate_stats(list(dataset.meta.episodes_stats.values()))
-    for key, ft in dataset.features.items():
-        # These values might need some fine-tuning
-        if ft["dtype"] == "video":
-            # to account for image sub-sampling
-            rtol, atol = video_rtol_atol
-        else:
-            rtol, atol = default_rtol_atol
+    if root is not None:
+        dataset = LeRobotDataset(repo_id, root, revision=V20)
+    else:
+        dataset = LeRobotDataset(repo_id, revision=V20, force_cache_sync=True)
 
-        for stat, val in agg_stats[key].items():
-            if key in reference_stats and stat in reference_stats[key]:
-                err_msg = f"feature='{key}' stats='{stat}'"
-                np.testing.assert_allclose(val, reference_stats[key][stat], rtol=rtol, atol=atol, err_msg=err_msg)
+    errors = convert_stats(dataset, num_workers=num_workers)
+    if errors:
+        print(f"Encountered {len(errors)} episode-level errors. See '{dataset.root / ERROR_LOG_PATH}' for details.")
+        return
+
+    ref_stats = load_stats(dataset.root)
+    check_aggregate_stats(dataset, ref_stats)
+
+    dataset.meta.info["codebase_version"] = V21
+    write_info(dataset.meta.info, dataset.root)
+
+    if push_to_hub:
+        dataset.push_to_hub(branch=branch, tag_version=False, allow_patterns="meta/")
+
+    # delete old stats.json file
+    if delete_old_stats and (dataset.root / STATS_PATH).is_file:
+        (dataset.root / STATS_PATH).unlink()
+
+    hub_api = HfApi()
+    if delete_old_stats and hub_api.file_exists(
+        repo_id=dataset.repo_id, filename=STATS_PATH, revision=branch, repo_type="dataset"
+    ):
+        hub_api.delete_file(path_in_repo=STATS_PATH, repo_id=dataset.repo_id, revision=branch, repo_type="dataset")
+    if push_to_hub:
+        hub_api.create_tag(repo_id, tag=V21, revision=branch, repo_type="dataset")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--repo-id",
+        type=str,
+        required=True,
+        help="Repository identifier on Hugging Face: a community or a user name `/` the name of the dataset "
+        "(e.g. `lerobot/pusht`, `cadene/aloha_sim_insertion_human`).",
+    )
+    parser.add_argument(
+        "--root",
+        type=str,
+        default=None,
+        help="Path to the local dataset root directory. If not provided, the script will use the dataset from local.",
+    )
+    parser.add_argument(
+        "--push-to-hub",
+        action="store_true",
+        help="Push the dataset to the hub after conversion. Defaults to False.",
+    )
+    parser.add_argument(
+        "--delete-old-stats",
+        action="store_true",
+        help="Delete the old stats.json file after conversion. Defaults to False.",
+    )
+    parser.add_argument(
+        "--branch",
+        type=str,
+        default=None,
+        help="Repo branch to push your dataset. Defaults to the main branch.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help="Number of workers for parallelizing stats compute. Defaults to 4.",
+    )
+
+    args = parser.parse_args()
+    convert_dataset(**vars(args))
