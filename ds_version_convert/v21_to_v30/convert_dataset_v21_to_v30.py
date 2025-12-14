@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 import jsonlines
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import tqdm
@@ -142,6 +143,45 @@ def legacy_load_tasks(local_dir: Path) -> tuple[dict, dict]:
     tasks = {item["task_index"]: item["task"] for item in sorted(tasks, key=lambda x: x["task_index"])}
     task_to_task_index = {task: task_index for task_index, task in tasks.items()}
     return tasks, task_to_task_index
+
+
+def _normalize_legacy_image_stats(root: Path, episodes_stats: dict[int, dict]) -> dict[int, dict]:
+    """Ensure legacy image/video stats have 3 channels to satisfy v3.0 expectations.
+
+    Some datasets may have per-episode image/video stats stored as (1,1,1) instead of (3,1,1)
+    for grayscale frames. This function normalizes them to (3,1,1) by repeating the
+    single channel, matching the downstream checks in compute_stats.aggregate_stats.
+    """
+    info = load_info(root)
+    features = info["features"]
+    # include both image & video dtypes, plus any key name containing 'image'
+    image_like_keys = {
+        k
+        for k, ft in features.items()
+        if ft.get("dtype") in ("image", "video") or "image" in k
+    }
+
+    for ep_idx, stats in episodes_stats.items():
+        for fkey in image_like_keys:
+            if fkey not in stats:
+                continue
+            fstats = stats[fkey]
+            for sk, sv in list(fstats.items()):
+                if sk == "count":
+                    continue
+                arr = sv
+                if not isinstance(arr, np.ndarray):
+                    continue
+                # normalize to (C,1,1) with C=3
+                if arr.ndim == 2:
+                    arr = arr[None, ...]
+                if arr.shape[0] == 1:
+                    arr = np.repeat(arr, 3, axis=0)
+                elif arr.shape[0] > 3:
+                    arr = arr[:3]
+                fstats[sk] = arr
+
+    return episodes_stats
 
 
 def validate_local_dataset_version(local_path: Path) -> None:
@@ -396,6 +436,7 @@ def convert_episodes_metadata(root, new_root, episodes_metadata, episodes_video_
 
     episodes_legacy_metadata = legacy_load_episodes(root)
     episodes_stats = legacy_load_episodes_stats(root)
+    episodes_stats = _normalize_legacy_image_stats(root, episodes_stats)
 
     num_eps_set = {len(episodes_legacy_metadata), len(episodes_metadata)}
     if episodes_video_metadata is not None:
